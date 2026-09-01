@@ -227,6 +227,19 @@ class Provisioner:
             LOG.exception("Failed to start AP")
             return False
 
+    def open_provisioning(self) -> None:
+        """Prepare the single radio for browser provisioning."""
+        if not self.iface:
+            self.last_error = "No Wi-Fi interface found"
+            self.notify_ble()
+            return
+        try:
+            self.networks = scan_wifi(self.iface)
+            self.last_scan = time.monotonic()
+        except Exception as exc:
+            LOG.warning("Provisioning scan failed: %s", exc)
+        self.start_ap()
+
     def stop_ap(self) -> None:
         with self.lock:
             if not self.ap_active:
@@ -370,8 +383,8 @@ class BLEProvisioner:
             setattr(self, kind, text)
         elif kind == "command":
             cmd = text.strip().upper()
-            if cmd == "CONNECT" and valid_text(self.ssid, 32) and len(self.password) <= 128:
-                threading.Thread(target=self.p.provision, args=(self.ssid, self.password), daemon=True).start()
+            if cmd in ("PROVISION", "OPEN", "OPEN_BROWSER", "AP"):
+                threading.Thread(target=self.p.open_provisioning, daemon=True).start()
             elif cmd == "SCAN" and self.p.iface:
                 threading.Thread(target=self._scan, daemon=True).start()
             elif cmd == "RESET":
