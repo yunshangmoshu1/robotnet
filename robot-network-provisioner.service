@@ -2,6 +2,7 @@
 Description=Robot temporary Wi-Fi provisioning portal
 After=NetworkManager.service network.target
 Wants=NetworkManager.service
+Conflicts=ble-provisioning.service
 
 [Service]
 Type=simple

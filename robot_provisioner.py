@@ -9,6 +9,7 @@ the robot has been offline for a while and accepts a new STA profile over HTTP.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -22,6 +23,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+try:
+    from dbus_next import BusType, Variant
+    from dbus_next.aio import MessageBus
+    from dbus_next.service import ServiceInterface, dbus_property, method
+    DBUS_AVAILABLE = True
+except ImportError:
+    DBUS_AVAILABLE = False
 
 
 LOG = logging.getLogger("robot-provisioner")
@@ -133,6 +142,7 @@ class Provisioner:
         self.offline_since: Optional[float] = None
         self.previous_connection: Optional[str] = None
         self.last_scan = 0.0
+        self.ble_notify = None
 
     def status(self) -> Dict[str, Any]:
         # Populate the list on the first browser visit while the STA is online.
@@ -155,6 +165,14 @@ class Provisioner:
                 "error": self.last_error,
                 "networks": self.networks,
             }
+
+    def notify_ble(self) -> None:
+        callback = self.ble_notify
+        if callback:
+            try:
+                callback()
+            except Exception:
+                LOG.debug("BLE status notification failed", exc_info=True)
 
     def ap_ssid(self) -> str:
         # Stable, unique enough for a local provisioning hotspot.
@@ -199,6 +217,7 @@ class Provisioner:
                 self.ap_active = True
                 self.transition = False
                 self.last_error = ""
+            self.notify_ble()
             LOG.info("Provisioning AP active: %s / %s", self.ap_ssid(), self.ap_password())
             return True
         except Exception as exc:
@@ -217,6 +236,7 @@ class Provisioner:
         with self.lock:
             self.ap_active = False
             self.transition = False
+        self.notify_ble()
 
     def provision(self, ssid: str, password: str) -> None:
         with self.lock:
@@ -236,6 +256,7 @@ class Provisioner:
             with self.lock:
                 self.transition = False
                 self.last_error = ""
+            self.notify_ble()
             LOG.info("Wi-Fi provisioned successfully on %s", ssid)
         except Exception as exc:
             LOG.warning("Wi-Fi provisioning failed: %s", exc)
@@ -244,6 +265,7 @@ class Provisioner:
             with self.lock:
                 self.last_error = str(exc)
                 self.transition = False
+            self.notify_ble()
             self.networks = scan_wifi(self.iface) if self.iface else []
             self.start_ap()
 
@@ -256,16 +278,25 @@ class Provisioner:
                 self.offline_since = None
                 if self.ap_active:
                     self.stop_ap()
+                if time.monotonic() - self.last_scan >= 30 and not self.transition:
+                    try:
+                        self.networks = scan_wifi(self.iface)
+                        self.last_scan = time.monotonic()
+                    except Exception as exc:
+                        LOG.warning("Periodic Wi-Fi scan failed: %s", exc)
                 continue
             if self.offline_since is None:
                 self.offline_since = time.monotonic()
             if not self.ap_active and not self.transition and time.monotonic() - self.offline_since >= OFFLINE_GRACE_SECONDS:
                 self.networks = scan_wifi(self.iface)
+                self.last_scan = time.monotonic()
                 self.start_ap()
 
     def serve(self) -> None:
         self.worker = threading.Thread(target=self.monitor, daemon=True)
         self.worker.start()
+        if DBUS_AVAILABLE:
+            threading.Thread(target=lambda: asyncio.run(BLEProvisioner(self).run()), daemon=True).start()
         while not self.stop_event.wait(1):
             if self.httpd is None:
                 self.httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
@@ -277,17 +308,155 @@ class Provisioner:
             self.httpd.server_close()
 
 
-HTML = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>机器人 Wi‑Fi 配网</title><style>body{font:16px sans-serif;max-width:560px;margin:2em auto;padding:0 1em}label{display:block;margin-top:1em}select,input,button{width:100%;padding:.7em;font-size:1em}button{margin-top:1.4em}#msg{margin-top:1em;white-space:pre-wrap}</style>
-<h2>机器人 Wi‑Fi 配网</h2><p>请选择目标 Wi‑Fi 并输入密码。提交后热点会暂时断开，机器人将连接目标网络。</p>
-<label>Wi‑Fi<select id='ssid'><option>正在扫描…</option></select></label>
-<label>SSID（也可手动输入）<input id='ssidText' maxlength='32' placeholder='隐藏网络请手动输入'></label>
-<label>密码（开放网络可留空）<input id='password' type='password' maxlength='128'></label>
-<button onclick='submitWifi()'>连接</button><div id='msg'></div>
-<script>
-async function load(){let r=await fetch('/api/status');let s=await r.json();let e=document.getElementById('ssid');e.innerHTML='';(s.networks||[]).forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.signal+'%) '+(n.security||'开放');e.appendChild(o)});e.onchange=()=>document.getElementById('ssidText').value=e.value;}
-async function submitWifi(){let ssid=document.getElementById('ssidText').value||document.getElementById('ssid').value;let password=document.getElementById('password').value;document.getElementById('msg').textContent='正在连接，请等待…';let r=await fetch('/api/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password})});document.getElementById('msg').textContent=await r.text();} load();
-</script></html>"""
+BLE_SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
+BLE_SSID_UUID = "12345678-1234-5678-1234-56789abcdef1"
+BLE_PASSWORD_UUID = "12345678-1234-5678-1234-56789abcdef2"
+BLE_STATUS_UUID = "12345678-1234-5678-1234-56789abcdef3"
+BLE_COMMAND_UUID = "12345678-1234-5678-1234-56789abcdef4"
+BLE_WIFILIST_UUID = "12345678-1234-5678-1234-56789abcdef5"
+
+
+class BLEProvisioner:
+    """Small BlueZ GATT bridge using the same Provisioner instance as HTTP."""
+
+    def __init__(self, provisioner: Provisioner) -> None:
+        self.p = provisioner
+        self.bus = None
+        self.status_char = None
+        self.ssid = ""
+        self.password = ""
+
+    async def run(self) -> None:
+        if not DBUS_AVAILABLE:
+            LOG.warning("dbus-next unavailable; BLE disabled")
+            return
+        self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        app = BLEApplication(self)
+        service = BLEService()
+        self.status_char = BLECharacteristic(self, BLE_STATUS_UUID, ["read", "notify"], "status")
+        ssid_char = BLECharacteristic(self, BLE_SSID_UUID, ["write", "write-without-response"], "ssid")
+        password_char = BLECharacteristic(self, BLE_PASSWORD_UUID, ["write", "write-without-response"], "password")
+        command_char = BLECharacteristic(self, BLE_COMMAND_UUID, ["write", "write-without-response"], "command")
+        list_char = BLECharacteristic(self, BLE_WIFILIST_UUID, ["read"], "list")
+        objects = [("/service0", service), ("/char0", ssid_char), ("/char1", password_char), ("/char2", self.status_char), ("/char3", command_char), ("/char4", list_char)]
+        self._objects = objects
+        self.bus.export("/org/bluez/robotprovisioning", app)
+        for suffix, obj in objects:
+            self.bus.export("/org/bluez/robotprovisioning" + suffix, obj)
+        self.p.ble_notify = self.notify_status
+        introspection = await self.bus.introspect("org.bluez", "/org/bluez/hci0")
+        adapter = self.bus.get_proxy_object("org.bluez", "/org/bluez/hci0", introspection)
+        gatt = adapter.get_interface("org.bluez.GattManager1")
+        await gatt.call_register_application("/org/bluez/robotprovisioning", {})
+        adv = BLEAdvertisement(self.p.ap_ssid())
+        self.bus.export("/org/bluez/robotprovisioning/advertisement0", adv)
+        advertising = adapter.get_interface("org.bluez.LEAdvertisingManager1")
+        await advertising.call_register_advertisement("/org/bluez/robotprovisioning/advertisement0", {})
+        LOG.info("BLE Wi-Fi provisioning ready: %s", self.p.ap_ssid())
+        while not self.p.stop_event.is_set():
+            await asyncio.sleep(1)
+
+    def read(self, kind: str) -> bytes:
+        if kind == "status":
+            return json.dumps(self.p.status(), ensure_ascii=False).encode()
+        if kind == "list":
+            return json.dumps(self.p.networks, ensure_ascii=False).encode()
+        return getattr(self, kind).encode()
+
+    def write(self, kind: str, value: bytes) -> None:
+        text = value.decode("utf-8", errors="strict").rstrip("\x00")
+        if kind in ("ssid", "password"):
+            setattr(self, kind, text)
+        elif kind == "command":
+            cmd = text.strip().upper()
+            if cmd == "CONNECT" and valid_text(self.ssid, 32) and len(self.password) <= 128:
+                threading.Thread(target=self.p.provision, args=(self.ssid, self.password), daemon=True).start()
+            elif cmd == "SCAN" and self.p.iface:
+                threading.Thread(target=self._scan, daemon=True).start()
+            elif cmd == "RESET":
+                self.ssid = ""
+                self.password = ""
+        self.notify_status()
+
+    def _scan(self) -> None:
+        try:
+            self.p.networks = scan_wifi(self.p.iface)
+            self.p.last_scan = time.monotonic()
+            self.notify_status()
+        except Exception:
+            LOG.exception("BLE Wi-Fi scan failed")
+
+    def notify_status(self) -> None:
+        if not self.status_char or not self.bus:
+            return
+        try:
+            self.bus.emit_signal(None, "/org/bluez/robotprovisioning/char2", "org.freedesktop.DBus.Properties", "PropertiesChanged", "sa{sv}as", ["org.bluez.GattCharacteristic1", {"Value": Variant("ay", list(self.read("status")))}, []])
+        except Exception:
+            LOG.debug("BLE notification unavailable", exc_info=True)
+
+
+class BLEApplication(ServiceInterface):
+    def __init__(self, bridge: BLEProvisioner) -> None:
+        super().__init__("org.freedesktop.DBus.ObjectManager")
+        self.bridge = bridge
+
+    @method()
+    def GetManagedObjects(self) -> "a{oa{sa{sv}}}":
+        base = "/org/bluez/robotprovisioning"
+        result = {base + "/service0": {"org.bluez.GattService1": {"UUID": Variant("s", BLE_SERVICE_UUID), "Primary": Variant("b", True)}}}
+        definitions = [("char0", BLE_SSID_UUID, ["write", "write-without-response"]), ("char1", BLE_PASSWORD_UUID, ["write", "write-without-response"]), ("char2", BLE_STATUS_UUID, ["read", "notify"]), ("char3", BLE_COMMAND_UUID, ["write", "write-without-response"]), ("char4", BLE_WIFILIST_UUID, ["read"])]
+        for name, uuid, flags in definitions:
+            result[base + "/" + name] = {"org.bluez.GattCharacteristic1": {"UUID": Variant("s", uuid), "Service": Variant("o", base + "/service0"), "Flags": Variant("as", flags)}}
+        return result
+
+
+class BLEService(ServiceInterface):
+    def __init__(self) -> None:
+        super().__init__("org.bluez.GattService1")
+
+    @dbus_property()
+    def UUID(self) -> "s": return BLE_SERVICE_UUID
+    @dbus_property()
+    def Primary(self) -> "b": return True
+
+
+class BLECharacteristic(ServiceInterface):
+    def __init__(self, bridge: BLEProvisioner, uuid: str, flags: List[str], kind: str) -> None:
+        super().__init__("org.bluez.GattCharacteristic1")
+        self.bridge, self.uuid, self.flags, self.kind = bridge, uuid, flags, kind
+
+    @dbus_property()
+    def UUID(self) -> "s": return self.uuid
+    @dbus_property()
+    def Service(self) -> "o": return "/org/bluez/robotprovisioning/service0"
+    @dbus_property()
+    def Flags(self) -> "as": return self.flags
+    @method()
+    def ReadValue(self, options: "a{sv}") -> "ay": return list(self.bridge.read(self.kind))
+    @method()
+    def WriteValue(self, value: "ay", options: "a{sv}") -> None: self.bridge.write(self.kind, bytes(value))
+    @method()
+    def StartNotify(self) -> None: return None
+    @method()
+    def StopNotify(self) -> None: return None
+
+
+class BLEAdvertisement(ServiceInterface):
+    def __init__(self, name: str) -> None:
+        super().__init__("org.bluez.LEAdvertisement1")
+        self.name = name
+    @dbus_property()
+    def Type(self) -> "s": return "peripheral"
+    @dbus_property()
+    def ServiceUUIDs(self) -> "as": return [BLE_SERVICE_UUID]
+    @dbus_property()
+    def LocalName(self) -> "s": return self.name
+
+
+HTML = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>机器人网络设置</title><style>
+:root{color-scheme:light;--blue:#2563eb;--bg:#f3f6fb;--card:#fff;--text:#172033;--muted:#64748b;--line:#e2e8f0}*{box-sizing:border-box}body{margin:0;background:var(--bg);font:15px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:var(--text)}main{max-width:620px;margin:0 auto;padding:24px 16px 48px}.hero{background:linear-gradient(135deg,#1d4ed8,#2563eb 55%,#38bdf8);color:#fff;border-radius:22px;padding:24px;box-shadow:0 12px 30px #1d4ed833}.hero h1{margin:0 0 8px;font-size:25px}.hero p{margin:0;opacity:.88}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;margin-top:16px;padding:20px;box-shadow:0 4px 16px #0f172a0b}.row{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{border-radius:999px;padding:5px 10px;font-size:12px;background:#dcfce7;color:#166534}.pill.ap{background:#fef3c7;color:#92400e}.label{display:block;color:var(--muted);font-size:13px;margin:16px 0 7px}select,input,button{width:100%;border:1px solid var(--line);border-radius:11px;padding:12px;font:inherit;background:#fff}select:focus,input:focus{outline:3px solid #2563eb22;border-color:var(--blue)}button{border:0;background:var(--blue);color:#fff;font-weight:650;cursor:pointer;margin-top:18px}button.secondary{background:#eff6ff;color:#1d4ed8;margin-top:10px}.password{display:flex;gap:8px}.password input{flex:1}.password button{width:auto;margin:0;padding:0 14px;background:#eef2ff;color:#3730a3}.hint{color:var(--muted);font-size:13px;line-height:1.55}.network{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line)}.network:last-child{border:0}.signal{color:var(--muted);font-size:13px}#message{margin-top:14px;padding:11px;border-radius:10px;display:none;line-height:1.5}.ok{display:block!important;background:#ecfdf5;color:#166534}.err{display:block!important;background:#fef2f2;color:#991b1b}.spin{display:inline-block;width:14px;height:14px;border:2px solid #fff6;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:420px){main{padding:12px 10px 32px}.hero{border-radius:16px;padding:20px}.card{padding:16px}}
+</style></head><body><main><section class='hero'><h1>机器人网络设置</h1><p>浏览器与 BLE 共用同一套网络配置服务</p></section><section class='card'><div class='row'><strong>当前状态</strong><span id='state' class='pill'>读取中</span></div><p id='detail' class='hint'>正在读取机器人状态…</p></section><section class='card'><div class='row'><strong>选择目标 Wi‑Fi</strong><button class='secondary' style='width:auto;margin:0' onclick='load(true)'>刷新列表</button></div><label class='label'>附近网络</label><select id='list'><option>正在扫描…</option></select><label class='label'>SSID（隐藏网络可手动填写）</label><input id='ssid' maxlength='32' placeholder='输入 Wi‑Fi 名称'><label class='label'>密码</label><div class='password'><input id='password' type='password' maxlength='128' placeholder='开放网络可留空'><button type='button' onclick='togglePassword()'>显示</button></div><button id='submit' onclick='submitWifi()'>连接此 Wi‑Fi</button><div id='message'></div></section><section class='card'><strong>使用提示</strong><p class='hint'>连接过程中当前网络会短暂断开，但机器人上的 ROS/ROS2 进程不会停止。连接成功后，请让手机回到目标 Wi‑Fi，再使用新的机器人 IP 访问本页面。</p></section></main><script>
+let timer;function show(text,ok){let e=document.getElementById('message');e.textContent=text;e.className=ok?'ok':'err'}function togglePassword(){let e=document.getElementById('password'),b=document.querySelector('.password button');e.type=e.type==='password'?'text':'password';b.textContent=e.type==='password'?'显示':'隐藏'}function render(s){let st=document.getElementById('state'),d=document.getElementById('detail');st.textContent=s.transition?'正在切换':s.ap_active?'临时热点':'已联网';st.className='pill '+(s.ap_active?'ap':'');d.textContent=(s.sta_connection?'当前网络：'+s.sta_connection+'　':'')+(s.ip?'IP：'+s.ip:'')+(s.ap_active?'　热点：'+s.ap_ssid:'');let l=document.getElementById('list');if(document.activeElement!==l){l.innerHTML='';(s.networks||[]).forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+'　信号 '+n.signal+'%　'+(n.security||'开放');l.appendChild(o)});if(!s.networks?.length){l.innerHTML='<option>未发现网络，请手动填写 SSID</option>'}}l.onchange=()=>document.getElementById('ssid').value=l.value}async function load(force){try{let r=await fetch('/api/status?x='+Date.now());let s=await r.json();render(s);if(force)show('Wi‑Fi 列表已刷新',true)}catch(e){show('无法读取机器人状态，请确认手机仍在同一网络。',false)}}async function submitWifi(){let ssid=document.getElementById('ssid').value||document.getElementById('list').value,p=document.getElementById('password').value;if(!ssid){show('请先选择或填写 SSID。',false);return}let b=document.getElementById('submit');b.disabled=true;b.innerHTML='<span class="spin"></span>正在连接…';try{let r=await fetch('/api/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password:p})});let x=await r.json();show(x.message||x.error||'配置已提交',r.ok);if(r.ok)timer=setInterval(()=>load(false),3000)}catch(e){show('网络切换已开始，页面即将断开。',true)}finally{setTimeout(()=>{b.disabled=false;b.textContent='连接此 Wi‑Fi'},5000)}}load(false);</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):

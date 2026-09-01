@@ -14,7 +14,9 @@
 - 连接失败时尝试恢复旧连接，然后重新开启 AP。
 - 不停止 ROS/ROS2 进程，不依赖 ROS。
 
-机器人上原有的 `ble-provisioning.service` 仍可作为 BLE 入口；浏览器和 BLE 最终都由 NetworkManager 执行 Wi-Fi 切换。BLE 入口适合手机无法加入机器人当前局域网的场景。
+BLE 已融合到本服务中，UUID 与原版本兼容。使用 nRF Connect 或现有 Flutter App 连接 `LubanCat-XXXX` 后：写入 `...abcdef1`（SSID）、写入 `...abcdef2`（密码），再向 `...abcdef4` 写入 `CONNECT`；读取/订阅 `...abcdef3` 获取状态，向 `...abcdef4` 写入 `SCAN` 可刷新列表。浏览器和 BLE 最终都由同一个 NetworkManager 网络切换逻辑处理。
+
+部署融合版本前应停用旧的 `ble-provisioning.service`，避免两个 GATT 服务重复注册同一组 UUID。
 
 ## 安装
 
