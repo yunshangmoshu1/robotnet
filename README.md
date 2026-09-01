@@ -34,8 +34,6 @@ sudo systemctl enable --now robot-network-provisioner.service
 
 ## 注意
 
-离线 BLE 配网网页位于 `web/index.html`，通过 Web Bluetooth 连接机器人后直接发送 SSID/密码；该页面必须从 HTTPS 安全来源打开。机器人端不再需要开启 AP。需要注意 Web Bluetooth 不是所有浏览器都支持，使用前应在目标 Android 浏览器上验证。
-
-在线网页仍使用：`http://机器人IP:8080/`。离线 BLE 页面流程：打开 HTTPS 页面 → 点击“连接机器人蓝牙” → 选择 Wi-Fi → 输入密码 → 连接。
+这是第一版普通 Wi-Fi 配网实现，暂不包含企业 802.1X、Captive Portal、BLE 配网和运行中改网认证。AP+STA 并发不需要也不使用。
 
 生产使用前应增加物理/显示屏触发的配网窗口，并对网页增加一次性配网 PIN；当前自动 AP 模式适合现场验证。

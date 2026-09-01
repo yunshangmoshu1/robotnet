@@ -434,8 +434,6 @@ class BLEProvisioner:
             cmd = text.strip().upper()
             if cmd in ("PROVISION", "OPEN", "OPEN_BROWSER", "AP"):
                 threading.Thread(target=self.p.open_provisioning, daemon=True).start()
-            elif cmd == "CONNECT" and valid_text(self.ssid, 32) and len(self.password) <= 128:
-                threading.Thread(target=self.p.provision, args=(self.ssid, self.password), daemon=True).start()
             elif cmd == "SCAN" and self.p.iface and not self.p.ap_active:
                 threading.Thread(target=self._scan, daemon=True).start()
             elif cmd == "RESET":
