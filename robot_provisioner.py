@@ -348,8 +348,8 @@ class BLEProvisioner:
         adapter = self.bus.get_proxy_object("org.bluez", "/org/bluez/hci0", introspection)
         gatt = adapter.get_interface("org.bluez.GattManager1")
         await gatt.call_register_application("/org/bluez/robotprovisioning", {})
-        adv = BLEAdvertisement(self.p.ap_ssid())
-        self.bus.export("/org/bluez/robotprovisioning/advertisement0", adv)
+        self.adv = BLEAdvertisement(self.p.ap_ssid())
+        self.bus.export("/org/bluez/robotprovisioning/advertisement0", self.adv)
         advertising = adapter.get_interface("org.bluez.LEAdvertisingManager1")
         await advertising.call_register_advertisement("/org/bluez/robotprovisioning/advertisement0", {})
         LOG.info("BLE Wi-Fi provisioning ready: %s", self.p.ap_ssid())
@@ -467,6 +467,8 @@ class BLEAdvertisement(ServiceInterface):
     def LocalName(self) -> "s": return self.name
     @LocalName.setter
     def LocalName(self, value: "s"): pass
+    @method()
+    def Release(self): pass
 
 
 HTML = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>机器人网络设置</title><style>
