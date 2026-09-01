@@ -132,13 +132,22 @@ class Provisioner:
         self.worker: Optional[threading.Thread] = None
         self.offline_since: Optional[float] = None
         self.previous_connection: Optional[str] = None
+        self.last_scan = 0.0
 
     def status(self) -> Dict[str, Any]:
+        # Populate the list on the first browser visit while the STA is online.
+        if self.iface and not self.networks and time.monotonic() - self.last_scan > 30:
+            try:
+                self.networks = scan_wifi(self.iface)
+                self.last_scan = time.monotonic()
+            except Exception as exc:
+                LOG.warning("Wi-Fi scan failed: %s", exc)
         with self.lock:
             return {
                 "ap_active": self.ap_active,
                 "ap_ssid": self.ap_ssid(),
                 "ap_url": AP_URL if self.ap_active else "",
+                "online_url": f"http://{ip_address(self.iface)}/" if self.iface and ip_address(self.iface) else "",
                 "wifi_interface": self.iface,
                 "sta_connection": active_wifi(self.iface) if self.iface else None,
                 "ip": ip_address(self.iface) if self.iface else None,
@@ -213,7 +222,7 @@ class Provisioner:
         with self.lock:
             self.transition = True
             self.last_error = ""
-        old_connection = self.previous_connection
+        old_connection = self.previous_connection or (active_wifi(self.iface) if self.iface else None)
         try:
             # Stop AP before using the single radio as STA.
             self.stop_ap()
@@ -258,15 +267,11 @@ class Provisioner:
         self.worker = threading.Thread(target=self.monitor, daemon=True)
         self.worker.start()
         while not self.stop_event.wait(1):
-            if self.ap_active and self.httpd is None:
+            if self.httpd is None:
                 self.httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
                 self.httpd.provisioner = self  # type: ignore[attr-defined]
                 threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-                LOG.info("Web portal available at %s", AP_URL)
-            elif not self.ap_active and self.httpd is not None:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-                self.httpd = None
+                LOG.info("Web portal listening on port %s (STA or AP)", HTTP_PORT)
         if self.httpd:
             self.httpd.shutdown()
             self.httpd.server_close()
