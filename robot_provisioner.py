@@ -349,9 +349,10 @@ class BLEProvisioner:
         gatt = adapter.get_interface("org.bluez.GattManager1")
         await gatt.call_register_application("/org/bluez/robotprovisioning", {})
         self.adv = BLEAdvertisement(self.p.ap_ssid())
-        self.bus.export("/org/bluez/robotprovisioning/advertisement0", self.adv)
+        self.adv_path = "/org/bluez/robotadvertisement0"
+        self.bus.export(self.adv_path, self.adv)
         advertising = adapter.get_interface("org.bluez.LEAdvertisingManager1")
-        await advertising.call_register_advertisement("/org/bluez/robotprovisioning/advertisement0", {})
+        await advertising.call_register_advertisement(self.adv_path, {})
         LOG.info("BLE Wi-Fi provisioning ready: %s", self.p.ap_ssid())
         while not self.p.stop_event.is_set():
             await asyncio.sleep(1)
