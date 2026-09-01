@@ -38,8 +38,8 @@ STATE_DIR = Path("/var/lib/robot-network-provisioner")
 STATE_FILE = STATE_DIR / "state.json"
 AP_PROFILE = "robot-provisioning-ap"
 AP_ADDRESS = "192.168.4.1/24"
-AP_URL = "http://192.168.4.1/"
-HTTP_PORT = 80
+AP_URL = "http://192.168.4.1:8080/"
+HTTP_PORT = 8080
 OFFLINE_GRACE_SECONDS = 30
 CONNECT_TIMEOUT_SECONDS = 35
 
