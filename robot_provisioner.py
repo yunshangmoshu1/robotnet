@@ -416,8 +416,12 @@ class BLEService(ServiceInterface):
 
     @dbus_property()
     def UUID(self) -> "s": return BLE_SERVICE_UUID
+    @UUID.setter
+    def UUID(self, value: "s"): pass
     @dbus_property()
     def Primary(self) -> "b": return True
+    @Primary.setter
+    def Primary(self, value: "b"): pass
 
 
 class BLECharacteristic(ServiceInterface):
@@ -427,10 +431,16 @@ class BLECharacteristic(ServiceInterface):
 
     @dbus_property()
     def UUID(self) -> "s": return self.uuid
+    @UUID.setter
+    def UUID(self, value: "s"): pass
     @dbus_property()
     def Service(self) -> "o": return "/org/bluez/robotprovisioning/service0"
+    @Service.setter
+    def Service(self, value: "o"): pass
     @dbus_property()
     def Flags(self) -> "as": return self.flags
+    @Flags.setter
+    def Flags(self, value: "as"): pass
     @method()
     def ReadValue(self, options: "a{sv}") -> "ay": return list(self.bridge.read(self.kind))
     @method()
@@ -447,10 +457,16 @@ class BLEAdvertisement(ServiceInterface):
         self.name = name
     @dbus_property()
     def Type(self) -> "s": return "peripheral"
+    @Type.setter
+    def Type(self, value: "s"): pass
     @dbus_property()
     def ServiceUUIDs(self) -> "as": return [BLE_SERVICE_UUID]
+    @ServiceUUIDs.setter
+    def ServiceUUIDs(self, value: "as"): pass
     @dbus_property()
     def LocalName(self) -> "s": return self.name
+    @LocalName.setter
+    def LocalName(self, value: "s"): pass
 
 
 HTML = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>机器人网络设置</title><style>
