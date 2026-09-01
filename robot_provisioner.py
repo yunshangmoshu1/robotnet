@@ -434,11 +434,11 @@ class BLECharacteristic(ServiceInterface):
     @method()
     def ReadValue(self, options: "a{sv}") -> "ay": return list(self.bridge.read(self.kind))
     @method()
-    def WriteValue(self, value: "ay", options: "a{sv}") -> None: self.bridge.write(self.kind, bytes(value))
+    def WriteValue(self, value: "ay", options: "a{sv}"): self.bridge.write(self.kind, bytes(value))
     @method()
-    def StartNotify(self) -> None: return None
+    def StartNotify(self): return None
     @method()
-    def StopNotify(self) -> None: return None
+    def StopNotify(self): return None
 
 
 class BLEAdvertisement(ServiceInterface):
