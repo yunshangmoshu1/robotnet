@@ -36,6 +36,7 @@ except ImportError:
 LOG = logging.getLogger("robot-provisioner")
 STATE_DIR = Path("/var/lib/robot-network-provisioner")
 STATE_FILE = STATE_DIR / "state.json"
+DEVICE_FILE = STATE_DIR / "device.json"
 AP_PROFILE = "robot-provisioning-ap"
 AP_ADDRESS = "192.168.4.1/24"
 AP_URL = "http://192.168.4.1:8080/"
@@ -128,6 +129,36 @@ def valid_text(value: Any, maximum: int) -> bool:
     return isinstance(value, str) and 0 < len(value) <= maximum and "\x00" not in value
 
 
+def read_device_identity(iface: Optional[str]) -> Dict[str, str]:
+    """Create a stable per-robot identity once and reuse it forever."""
+    try:
+        if DEVICE_FILE.exists():
+            data = json.loads(DEVICE_FILE.read_text())
+            if all(data.get(k) for k in ("robot_id", "ap_ssid", "ap_password")):
+                return data
+    except Exception:
+        LOG.warning("Unable to read device identity", exc_info=True)
+    mac = "robot"
+    if iface:
+        try:
+            mac = Path(f"/sys/class/net/{iface}/address").read_text().strip().replace(":", "")[-6:]
+        except OSError:
+            pass
+    suffix = mac.upper() or "ROBOT"
+    data = {
+        "robot_id": f"HT-{suffix}",
+        "ap_ssid": f"LubanCat-{suffix}",
+        "ap_password": f"Robot-{suffix}",
+    }
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        DEVICE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(DEVICE_FILE, 0o600)
+    except OSError:
+        LOG.warning("Unable to persist device identity", exc_info=True)
+    return data
+
+
 class Provisioner:
     def __init__(self) -> None:
         self.iface = wifi_interface()
@@ -143,27 +174,47 @@ class Provisioner:
         self.previous_connection: Optional[str] = None
         self.last_scan = 0.0
         self.ble_notify = None
+        self.identity = read_device_identity(self.iface)
+        self.load_scan_cache()
+
+    def load_scan_cache(self) -> None:
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            self.networks = data.get("networks", [])
+            self.last_scan = float(data.get("scan_time", 0))
+        except (OSError, ValueError, TypeError):
+            self.networks = []
+
+    def save_scan_cache(self) -> None:
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            STATE_FILE.write_text(json.dumps({"networks": self.networks, "scan_time": self.last_scan}, ensure_ascii=False))
+            os.chmod(STATE_FILE, 0o600)
+        except OSError:
+            LOG.warning("Unable to save Wi-Fi scan cache", exc_info=True)
 
     def status(self) -> Dict[str, Any]:
         # Populate the list on the first browser visit while the STA is online.
-        if self.iface and not self.networks and time.monotonic() - self.last_scan > 30:
+        if self.iface and not self.networks and not self.ap_active and time.time() - self.last_scan > 30:
             try:
                 self.networks = scan_wifi(self.iface)
-                self.last_scan = time.monotonic()
+                self.last_scan = time.time()
             except Exception as exc:
                 LOG.warning("Wi-Fi scan failed: %s", exc)
         with self.lock:
             return {
                 "ap_active": self.ap_active,
                 "ap_ssid": self.ap_ssid(),
+                "robot_id": self.identity["robot_id"],
                 "ap_url": AP_URL if self.ap_active else "",
-                "online_url": f"http://{ip_address(self.iface)}/" if self.iface and ip_address(self.iface) else "",
+                "online_url": f"http://{ip_address(self.iface)}:{HTTP_PORT}/" if self.iface and ip_address(self.iface) else "",
                 "wifi_interface": self.iface,
                 "sta_connection": active_wifi(self.iface) if self.iface else None,
                 "ip": ip_address(self.iface) if self.iface else None,
                 "transition": self.transition,
                 "error": self.last_error,
                 "networks": self.networks,
+                "scan_time": self.last_scan,
             }
 
     def notify_ble(self) -> None:
@@ -175,17 +226,10 @@ class Provisioner:
                 LOG.debug("BLE status notification failed", exc_info=True)
 
     def ap_ssid(self) -> str:
-        # Stable, unique enough for a local provisioning hotspot.
-        mac = "robot"
-        if self.iface:
-            result = subprocess.run(["cat", f"/sys/class/net/{self.iface}/address"], capture_output=True, text=True)
-            mac = result.stdout.strip().replace(":", "")[-6:] or mac
-        return f"LubanCat-{mac.upper()}"
+        return self.identity["ap_ssid"]
 
     def ap_password(self) -> str:
-        # The password is deterministic so it can be printed on the robot label
-        # or displayed by the existing UI without needing another service.
-        return f"Robot-{self.ap_ssid().split('-', 1)[-1]}"
+        return self.identity["ap_password"]
 
     def start_ap(self) -> bool:
         if not self.iface:
@@ -235,7 +279,7 @@ class Provisioner:
             return
         try:
             self.networks = scan_wifi(self.iface)
-            self.last_scan = time.monotonic()
+            self.last_scan = time.time()
         except Exception as exc:
             LOG.warning("Provisioning scan failed: %s", exc)
         self.start_ap()
@@ -280,6 +324,8 @@ class Provisioner:
                 self.transition = False
             self.notify_ble()
             self.networks = scan_wifi(self.iface) if self.iface else []
+            self.last_scan = time.time()
+            self.save_scan_cache()
             self.start_ap()
 
     def monitor(self) -> None:
@@ -291,10 +337,11 @@ class Provisioner:
                 self.offline_since = None
                 if self.ap_active:
                     self.stop_ap()
-                if time.monotonic() - self.last_scan >= 30 and not self.transition:
+                if time.time() - self.last_scan >= 30 and not self.transition and not self.ap_active:
                     try:
                         self.networks = scan_wifi(self.iface)
-                        self.last_scan = time.monotonic()
+                        self.last_scan = time.time()
+                        self.save_scan_cache()
                     except Exception as exc:
                         LOG.warning("Periodic Wi-Fi scan failed: %s", exc)
                 continue
@@ -302,7 +349,9 @@ class Provisioner:
                 self.offline_since = time.monotonic()
             if not self.ap_active and not self.transition and time.monotonic() - self.offline_since >= OFFLINE_GRACE_SECONDS:
                 self.networks = scan_wifi(self.iface)
-                self.last_scan = time.monotonic()
+                self.last_scan = time.time()
+                self.save_scan_cache()
+                self.save_scan_cache()
                 self.start_ap()
 
     def serve(self) -> None:
@@ -385,7 +434,7 @@ class BLEProvisioner:
             cmd = text.strip().upper()
             if cmd in ("PROVISION", "OPEN", "OPEN_BROWSER", "AP"):
                 threading.Thread(target=self.p.open_provisioning, daemon=True).start()
-            elif cmd == "SCAN" and self.p.iface:
+            elif cmd == "SCAN" and self.p.iface and not self.p.ap_active:
                 threading.Thread(target=self._scan, daemon=True).start()
             elif cmd == "RESET":
                 self.ssid = ""
@@ -395,7 +444,7 @@ class BLEProvisioner:
     def _scan(self) -> None:
         try:
             self.p.networks = scan_wifi(self.p.iface)
-            self.p.last_scan = time.monotonic()
+            self.p.last_scan = time.time()
             self.notify_status()
         except Exception:
             LOG.exception("BLE Wi-Fi scan failed")
@@ -487,8 +536,8 @@ class BLEAdvertisement(ServiceInterface):
 
 HTML = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>机器人网络设置</title><style>
 :root{color-scheme:light;--blue:#2563eb;--bg:#f3f6fb;--card:#fff;--text:#172033;--muted:#64748b;--line:#e2e8f0}*{box-sizing:border-box}body{margin:0;background:var(--bg);font:15px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:var(--text)}main{max-width:620px;margin:0 auto;padding:24px 16px 48px}.hero{background:linear-gradient(135deg,#1d4ed8,#2563eb 55%,#38bdf8);color:#fff;border-radius:22px;padding:24px;box-shadow:0 12px 30px #1d4ed833}.hero h1{margin:0 0 8px;font-size:25px}.hero p{margin:0;opacity:.88}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;margin-top:16px;padding:20px;box-shadow:0 4px 16px #0f172a0b}.row{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{border-radius:999px;padding:5px 10px;font-size:12px;background:#dcfce7;color:#166534}.pill.ap{background:#fef3c7;color:#92400e}.label{display:block;color:var(--muted);font-size:13px;margin:16px 0 7px}select,input,button{width:100%;border:1px solid var(--line);border-radius:11px;padding:12px;font:inherit;background:#fff}select:focus,input:focus{outline:3px solid #2563eb22;border-color:var(--blue)}button{border:0;background:var(--blue);color:#fff;font-weight:650;cursor:pointer;margin-top:18px}button.secondary{background:#eff6ff;color:#1d4ed8;margin-top:10px}.password{display:flex;gap:8px}.password input{flex:1}.password button{width:auto;margin:0;padding:0 14px;background:#eef2ff;color:#3730a3}.hint{color:var(--muted);font-size:13px;line-height:1.55}.network{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line)}.network:last-child{border:0}.signal{color:var(--muted);font-size:13px}#message{margin-top:14px;padding:11px;border-radius:10px;display:none;line-height:1.5}.ok{display:block!important;background:#ecfdf5;color:#166534}.err{display:block!important;background:#fef2f2;color:#991b1b}.spin{display:inline-block;width:14px;height:14px;border:2px solid #fff6;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:420px){main{padding:12px 10px 32px}.hero{border-radius:16px;padding:20px}.card{padding:16px}}
-</style></head><body><main><section class='hero'><h1>机器人网络设置</h1><p>浏览器与 BLE 共用同一套网络配置服务</p></section><section class='card'><div class='row'><strong>当前状态</strong><span id='state' class='pill'>读取中</span></div><p id='detail' class='hint'>正在读取机器人状态…</p></section><section class='card'><div class='row'><strong>选择目标 Wi‑Fi</strong><button class='secondary' style='width:auto;margin:0' onclick='load(true)'>刷新列表</button></div><label class='label'>附近网络</label><select id='list'><option>正在扫描…</option></select><label class='label'>SSID（隐藏网络可手动填写）</label><input id='ssid' maxlength='32' placeholder='输入 Wi‑Fi 名称'><label class='label'>密码</label><div class='password'><input id='password' type='password' maxlength='128' placeholder='开放网络可留空'><button type='button' onclick='togglePassword()'>显示</button></div><button id='submit' onclick='submitWifi()'>连接此 Wi‑Fi</button><div id='message'></div></section><section class='card'><strong>使用提示</strong><p class='hint'>连接过程中当前网络会短暂断开，但机器人上的 ROS/ROS2 进程不会停止。连接成功后，请让手机回到目标 Wi‑Fi，再使用新的机器人 IP 访问本页面。</p></section></main><script>
-let timer;function show(text,ok){let e=document.getElementById('message');e.textContent=text;e.className=ok?'ok':'err'}function togglePassword(){let e=document.getElementById('password'),b=document.querySelector('.password button');e.type=e.type==='password'?'text':'password';b.textContent=e.type==='password'?'显示':'隐藏'}function render(s){let st=document.getElementById('state'),d=document.getElementById('detail');st.textContent=s.transition?'正在切换':s.ap_active?'临时热点':'已联网';st.className='pill '+(s.ap_active?'ap':'');d.textContent=(s.sta_connection?'当前网络：'+s.sta_connection+'　':'')+(s.ip?'IP：'+s.ip:'')+(s.ap_active?'　热点：'+s.ap_ssid:'');let l=document.getElementById('list');if(document.activeElement!==l){l.innerHTML='';(s.networks||[]).forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+'　信号 '+n.signal+'%　'+(n.security||'开放');l.appendChild(o)});if(!s.networks?.length){l.innerHTML='<option>未发现网络，请手动填写 SSID</option>'}}l.onchange=()=>document.getElementById('ssid').value=l.value}async function load(force){try{let r=await fetch('/api/status?x='+Date.now());let s=await r.json();render(s);if(force)show('Wi‑Fi 列表已刷新',true)}catch(e){show('无法读取机器人状态，请确认手机仍在同一网络。',false)}}async function submitWifi(){let ssid=document.getElementById('ssid').value||document.getElementById('list').value,p=document.getElementById('password').value;if(!ssid){show('请先选择或填写 SSID。',false);return}let b=document.getElementById('submit');b.disabled=true;b.innerHTML='<span class="spin"></span>正在连接…';try{let r=await fetch('/api/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password:p})});let x=await r.json();show(x.message||x.error||'配置已提交',r.ok);if(r.ok)timer=setInterval(()=>load(false),3000)}catch(e){show('网络切换已开始，页面即将断开。',true)}finally{setTimeout(()=>{b.disabled=false;b.textContent='连接此 Wi‑Fi'},5000)}}load(false);</script></body></html>"""
+ </style></head><body><main><section class='hero'><h1>机器人网络设置</h1><p>浏览器与 BLE 共用同一套网络配置服务</p></section><section class='card'><div class='row'><strong>当前状态</strong><span id='state' class='pill'>读取中</span></div><p id='detail' class='hint'>正在读取机器人状态…</p></section><section class='card'><div class='row'><strong>可用 Wi‑Fi</strong><span id='scanTime' class='hint'></span></div><p class='hint'>列表由机器人后台扫描并缓存，热点开启后不会中断连接进行扫描。</p><label class='label'>附近网络</label><select id='list'><option>正在读取扫描缓存…</option></select><label class='label'>SSID（隐藏网络可手动填写）</label><input id='ssid' maxlength='32' placeholder='输入 Wi‑Fi 名称'><label class='label'>密码</label><div class='password'><input id='password' type='password' maxlength='128' placeholder='开放网络可留空'><button type='button' onclick='togglePassword()'>显示</button></div><label class='hint'><input id='remember' type='checkbox' checked style='width:auto'> 在此手机浏览器记住此机器人和 Wi‑Fi 的密码</label><button id='submit' onclick='submitWifi()'>连接此 Wi‑Fi</button><div id='message'></div></section><section class='card'><strong>使用提示</strong><p class='hint'>连接过程中当前网络会短暂断开，但机器人上的 ROS/ROS2 进程不会停止。连接成功后，请让手机回到目标 Wi‑Fi，再使用新的机器人 IP 访问本页面。</p></section></main><script>
+let timer;function show(text,ok){let e=document.getElementById('message');e.textContent=text;e.className=ok?'ok':'err'}function togglePassword(){let e=document.getElementById('password'),b=document.querySelector('.password button');e.type=e.type==='password'?'text':'password';b.textContent=e.type==='password'?'显示':'隐藏'}function render(s){let st=document.getElementById('state'),d=document.getElementById('detail');st.textContent=s.transition?'正在切换':s.ap_active?'临时热点':'已联网';st.className='pill '+(s.ap_active?'ap':'');d.textContent=(s.robot_id?'设备：'+s.robot_id+'　':'')+(s.sta_connection?'网络：'+s.sta_connection+'　':'')+(s.ip?'IP：'+s.ip:'')+(s.ap_active?'　热点：'+s.ap_ssid:'');document.getElementById('scanTime').textContent=s.scan_time?'上次扫描：'+new Date(s.scan_time*1000).toLocaleTimeString():'暂无扫描记录';let l=document.getElementById('list');if(document.activeElement!==l){l.innerHTML='';(s.networks||[]).forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+'　信号 '+n.signal+'%　'+(n.security||'开放');l.appendChild(o)});if(!s.networks?.length){l.innerHTML='<option>未发现网络，请手动填写 SSID</option>'}}l.onchange=()=>{document.getElementById('ssid').value=l.value;loadSavedPassword(s.robot_id,l.value)}}async function load(){try{let r=await fetch('/api/status?x='+Date.now());let s=await r.json();render(s);window.robotId=s.robot_id;loadSavedPassword(s.robot_id,document.getElementById('ssid').value)}catch(e){show('无法读取机器人状态，请确认手机仍在同一网络。',false)}}function loadSavedPassword(id,ssid){if(!id||!ssid)return;let v=localStorage.getItem('robotwifi:'+id+':'+ssid);if(v&&!document.getElementById('password').value)document.getElementById('password').value=v}async function submitWifi(){let ssid=document.getElementById('ssid').value||document.getElementById('list').value,p=document.getElementById('password').value;if(!ssid){show('请先选择或填写 SSID。',false);return}if(document.getElementById('remember').checked&&window.robotId)localStorage.setItem('robotwifi:'+window.robotId+':'+ssid,p);let b=document.getElementById('submit');b.disabled=true;b.innerHTML='<span class="spin"></span>正在连接…';try{let r=await fetch('/api/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password:p})});let x=await r.json();show(x.message||x.error||'配置已提交',r.ok);if(r.ok)timer=setInterval(()=>load(),3000)}catch(e){show('网络切换已开始，页面即将断开。',true)}finally{setTimeout(()=>{b.disabled=false;b.textContent='连接此 Wi‑Fi'},5000)}}load();</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
