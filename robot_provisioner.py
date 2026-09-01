@@ -347,12 +347,16 @@ class Provisioner:
                 continue
             if self.offline_since is None:
                 self.offline_since = time.monotonic()
-            if not self.ap_active and not self.transition and time.monotonic() - self.offline_since >= OFFLINE_GRACE_SECONDS:
-                self.networks = scan_wifi(self.iface)
-                self.last_scan = time.time()
-                self.save_scan_cache()
-                self.save_scan_cache()
-                self.start_ap()
+            # BLE is the offline provisioning path. AP is not auto-started:
+            # on this single-radio device AP would occupy wlan0 and interfere
+            # with reliable scanning and direct BLE provisioning.
+            if not self.ap_active and not self.transition and time.time() - self.last_scan >= 30:
+                try:
+                    self.networks = scan_wifi(self.iface)
+                    self.last_scan = time.time()
+                    self.save_scan_cache()
+                except Exception as exc:
+                    LOG.warning("Offline Wi-Fi scan failed: %s", exc)
 
     def serve(self) -> None:
         self.worker = threading.Thread(target=self.monitor, daemon=True)
