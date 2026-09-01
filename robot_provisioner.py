@@ -455,7 +455,7 @@ class BLECharacteristic(ServiceInterface):
 class BLEAdvertisement(ServiceInterface):
     def __init__(self, name: str) -> None:
         super().__init__("org.bluez.LEAdvertisement1")
-        self.name = name
+        self._local_name = name
     @dbus_property()
     def Type(self) -> "s": return "peripheral"
     @Type.setter
@@ -465,7 +465,7 @@ class BLEAdvertisement(ServiceInterface):
     @ServiceUUIDs.setter
     def ServiceUUIDs(self, value: "as"): pass
     @dbus_property()
-    def LocalName(self) -> "s": return self.name
+    def LocalName(self) -> "s": return self._local_name
     @LocalName.setter
     def LocalName(self, value: "s"): pass
     @method()
